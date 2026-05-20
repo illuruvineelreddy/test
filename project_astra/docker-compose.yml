@@ -1,0 +1,115 @@
+"""
+Docker Compose configuration for Project Astra infrastructure
+Includes: PostgreSQL with TimescaleDB, Redis, and application services
+"""
+version: '3.8'
+
+services:
+  # PostgreSQL with TimescaleDB extension
+  db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: astra_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: astra_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - astra_network
+
+  # Redis for caching and pub/sub
+  redis:
+    image: redis:7-alpine
+    container_name: astra_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - astra_network
+
+  # Main application
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: astra_app
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/astra_db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - ENVIRONMENT=development
+      - TRADING_MODE=paper
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - astra_network
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Celery worker for background tasks
+  celery_worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: astra_celery_worker
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/astra_db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+    depends_on:
+      - redis
+      - db
+    networks:
+      - astra_network
+    command: celery -A app.celery_app worker --loglevel=info
+
+  # Celery Flower for monitoring
+  flower:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: astra_flower
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+      - celery_worker
+    networks:
+      - astra_network
+    command: celery -A app.celery_app flower --port=5555
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  astra_network:
+    driver: bridge
